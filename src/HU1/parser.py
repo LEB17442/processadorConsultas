@@ -22,8 +22,19 @@ class SQLParserHU1:
         return query
 
     def tokenize(self, query: str) -> List[str]:
-        """Divide a consulta em tokens ignorando case mas mantendo a estrutura."""
-        pattern = r"[a-zA-Z0-9_.]+|<=|>=|<>|[=><(),]"
+        """
+        Divide a consulta SQL em tokens, capturando corretamente:
+        - Strings literais entre aspas simples/duplas (ex: 'Aberto', 'Luffy@gmail.com')
+        - Identificadores com @ (ex: e-mails)
+        - Operadores compostos e simples
+        """
+        # Padrão regex atualizado:
+        # 1. '[^']*' -> Captura qualquer texto entre aspas simples (ex: 'Aberto', 'Luffy@gmail.com')
+        # 2. "[^"]*" -> Captura qualquer texto entre aspas duplas
+        # 3. <=|>=|<> -> Operadores compostos
+        # 4. [a-zA-Z0-9_.@]+ -> Palavras, números, colunas com tabela, e-mails
+        # 5. [=><(),] -> Operadores simples e delimitadores
+        pattern = r"'[^']*'|\"[^\"]*\"|<=|>=|<>|[a-zA-Z0-9_.@]+|[=><(),]"
         return re.findall(pattern, query)
 
     def parse(self, query: str) -> Dict[str, Any]:
