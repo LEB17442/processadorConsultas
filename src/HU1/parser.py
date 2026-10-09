@@ -1,5 +1,5 @@
 import re
-from typing import Dict, List, Any, Tuple, Optional
+from typing import Dict, List, Any
 
 class ParseError(Exception):
     def __init__(self, message: str, error_type: str):
@@ -8,33 +8,26 @@ class ParseError(Exception):
         self.message = message
 
 class SQLParserHU1:
+    # Operadores válidos conforme especificação do enunciado da HU1
     VALID_OPERATORS = ['<=', '>=', '<>', '=', '>', '<']
+    ALLOWED_WHERE_TOKENS = VALID_OPERATORS + ['AND', '(', ')']
     KEYWORDS = {'SELECT', 'FROM', 'JOIN', 'ON', 'WHERE', 'AND'}
 
     def __init__(self, schema_data: Dict[str, List[str]]):
-        # Mapeamento em minúsculas para validação case-insensitive
         self.schema = {table.lower(): [col.lower() for col in cols] for table, cols in schema_data.items()}
         self.raw_schema = schema_data
 
     def _normalize_query(self, query: str) -> str:
-        """Remove quebras de linha e reduz espaços em branco repetidos."""
-        query = re.sub(r'\s+', ' ', query.strip())
-        return query
+        return re.sub(r'\s+', ' ', query.strip())
 
     def tokenize(self, query: str) -> List[str]:
         """
-        Divide a consulta SQL em tokens, capturando corretamente:
-        - Strings literais entre aspas simples/duplas (ex: 'Aberto', 'Luffy@gmail.com')
-        - Identificadores com @ (ex: e-mails)
-        - Operadores compostos e simples
+        Tokeniza a consulta suportando:
+        - Aspas e e-mails (@)
+        - Caractere asterisco (*) para SELECT *
+        - Operadores e delimitadores
         """
-        # Padrão regex atualizado:
-        # 1. '[^']*' -> Captura qualquer texto entre aspas simples (ex: 'Aberto', 'Luffy@gmail.com')
-        # 2. "[^"]*" -> Captura qualquer texto entre aspas duplas
-        # 3. <=|>=|<> -> Operadores compostos
-        # 4. [a-zA-Z0-9_.@]+ -> Palavras, números, colunas com tabela, e-mails
-        # 5. [=><(),] -> Operadores simples e delimitadores
-        pattern = r"'[^']*'|\"[^\"]*\"|<=|>=|<>|[a-zA-Z0-9_.@]+|[=><(),]"
+        pattern = r"'[^']*'|\"[^\"]*\"|<=|>=|<>|[a-zA-Z0-9_.@]+|[\*=><\(\),]"
         return re.findall(pattern, query)
 
     def parse(self, query: str) -> Dict[str, Any]:
@@ -46,20 +39,19 @@ class SQLParserHU1:
         tokens_upper = [t.upper() for t in tokens]
 
         if not tokens or tokens_upper[0] != "SELECT":
-            raise ParseError("Erro Sintático: A consulta deve iniciar obrigatoriamente com 'SELECT'.", "Sintatico")
+            raise ParseError("Erro Sintático: A consulta deve iniciar com 'SELECT'.", "Sintatico")
 
         if "FROM" not in tokens_upper:
             raise ParseError("Erro Sintático: Cláusula 'FROM' obrigatória não encontrada.", "Sintatico")
 
-        # Estrutura tratada para ser repassada às próximas HUs (HU2, HU3, etc.)
         parsed_result = {
             "select_attributes": [],
             "main_table": "",
-            "joins": [],  # Lista de dicts: [{'table': ..., 'on': (left, op, right)}]
+            "joins": [],
             "where_conditions": []
         }
 
-        # --- 1. PROCESSAR E VALIDAR CLÁUSULA SELECT ---
+        # --- 1. PROCESSAR E VALIDAR SELECT ---
         from_idx = tokens_upper.index("FROM")
         select_tokens = tokens[1:from_idx]
         if not select_tokens:
@@ -67,26 +59,22 @@ class SQLParserHU1:
 
         select_raw = " ".join(select_tokens)
         attributes = [attr.strip() for attr in select_raw.split(",") if attr.strip()]
-        if not attributes:
-            raise ParseError("Erro Sintático: Lista de atributos inválida no 'SELECT'.", "Sintatico")
 
-        # --- 2. PROCESSAR CLÁUSULAS E IDENTIFICAR TABELAS ---
-        # Identificar onde terminam JOINs/WHERE
+        # --- 2. PROCESSAR FROM E JOINS ---
         where_idx = tokens_upper.index("WHERE") if "WHERE" in tokens_upper else len(tokens)
         from_and_joins_tokens = tokens[from_idx + 1:where_idx]
-        
-        if not from_and_joins_tokens:
-            raise ParseError("Erro Sintático: Nenhuma tabela especificada após a cláusula 'FROM'.", "Sintatico")
 
-        # Primeira tabela (Main Table)
+        if not from_and_joins_tokens:
+            raise ParseError("Erro Sintático: Nenhuma tabela especificada após 'FROM'.", "Sintatico")
+
         main_table = from_and_joins_tokens[0]
         if not self._table_exists(main_table):
             raise ParseError(f"Erro Semântico: Tabela '{main_table}' não existe no modelo relacional.", "Semantico")
-        
+
         parsed_result["main_table"] = main_table
         active_tables = [main_table.lower()]
 
-        # Processar múltiplos JOINs (se existirem)
+        # Processar JOINs
         idx = 1
         while idx < len(from_and_joins_tokens):
             token_up = from_and_joins_tokens[idx].upper()
@@ -96,18 +84,17 @@ class SQLParserHU1:
                 
                 join_table = from_and_joins_tokens[idx + 1]
                 if not self._table_exists(join_table):
-                    raise ParseError(f"Erro Semântico: Tabela '{join_table}' do JOIN não existe no banco.", "Semantico")
+                    raise ParseError(f"Erro Semântico: Tabela '{join_table}' do JOIN não existe.", "Semantico")
 
                 if idx + 2 >= len(from_and_joins_tokens) or from_and_joins_tokens[idx + 2].upper() != "ON":
                     raise ParseError(f"Erro Sintático: Cláusula 'ON' esperada após 'JOIN {join_table}'.", "Sintatico")
 
-                # Condição do ON (ex: Pedido.Cliente_idCliente = Cliente.idCliente)
                 if idx + 5 >= len(from_and_joins_tokens):
-                    raise ParseError(f"Erro Sintático: Condição incompleta na cláusula 'ON' do JOIN '{join_table}'.", "Sintatico")
+                    raise ParseError(f"Erro Sintático: Condição incompleta no 'ON' do JOIN '{join_table}'.", "Sintatico")
 
-                left_operand = from_and_joins_tokens[idx + 3]
+                left_op = from_and_joins_tokens[idx + 3]
                 op = from_and_joins_tokens[idx + 4]
-                right_operand = from_and_joins_tokens[idx + 5]
+                right_op = from_and_joins_tokens[idx + 5]
 
                 if op not in self.VALID_OPERATORS:
                     raise ParseError(f"Erro Sintático: Operador '{op}' inválido na cláusula ON.", "Sintatico")
@@ -115,23 +102,25 @@ class SQLParserHU1:
                 active_tables.append(join_table.lower())
                 parsed_result["joins"].append({
                     "table": join_table,
-                    "on": (left_operand, op, right_operand)
+                    "on": (left_op, op, right_op)
                 })
                 idx += 6
             else:
-                raise ParseError(f"Erro Sintático: Palavra-chave ou símbolo inesperado '{from_and_joins_tokens[idx]}'.", "Sintatico")
+                raise ParseError(f"Erro Sintático: Token inesperado '{from_and_joins_tokens[idx]}'.", "Sintatico")
 
-        # Semântica dos Atributos do SELECT
+        # Validação semântica dos atributos do SELECT
         for attr in attributes:
-            self._validate_attribute(attr, active_tables)
+            if attr != "*":
+                self._validate_attribute(attr, active_tables)
             parsed_result["select_attributes"].append(attr)
 
-        # --- 3. PROCESSAR CLÁUSULA WHERE (OPCIONAL) ---
+        # --- 3. PROCESSAR E VALIDAR WHERE ---
         if where_idx < len(tokens):
             where_tokens = tokens[where_idx + 1:]
             if not where_tokens:
                 raise ParseError("Erro Sintático: Cláusula 'WHERE' informada sem condições.", "Sintatico")
-            # Validação básica de expressões no WHERE
+
+            self._validate_where_clause(where_tokens, active_tables)
             parsed_result["where_conditions"] = where_tokens
 
         return parsed_result
@@ -140,18 +129,35 @@ class SQLParserHU1:
         return table_name.lower() in self.schema
 
     def _validate_attribute(self, attr_expression: str, active_tables: List[str]):
-        """Valida se o atributo existe nas tabelas envolvidas na consulta."""
         if attr_expression == "*":
             return
 
         if "." in attr_expression:
             tbl, col = attr_expression.split(".", 1)
             if tbl.lower() not in active_tables:
-                raise ParseError(f"Erro Semântico: Tabela '{tbl}' não está presente na cláusula FROM/JOIN.", "Semantico")
+                raise ParseError(f"Erro Semântico: Tabela '{tbl}' não está no FROM/JOIN.", "Semantico")
             if col.lower() not in self.schema.get(tbl.lower(), []):
                 raise ParseError(f"Erro Semântico: Atributo '{col}' não existe na tabela '{tbl}'.", "Semantico")
         else:
-            # Atributo sem prefixo de tabela: deve existir em pelo menos uma das tabelas ativas
             found = any(attr_expression.lower() in self.schema[t] for t in active_tables if t in self.schema)
             if not found:
-                raise ParseError(f"Erro Semântico: Atributo '{attr_expression}' não pertence a nenhuma das tabelas da consulta.", "Semantico")
+                raise ParseError(f"Erro Semântico: Atributo '{attr_expression}' não pertence às tabelas da consulta.", "Semantico")
+
+    def _validate_where_clause(self, where_tokens: List[str], active_tables: List[str]):
+        """Valida operadores e atributos utilizados na cláusula WHERE."""
+        for token in where_tokens:
+            token_up = token.upper()
+
+            # Pula strings literais, números e operadores válidos
+            if (token.startswith("'") and token.endswith("'")) or \
+               (token.startswith('"') and token.endswith('"')) or \
+               token.isdigit() or \
+               token_up in self.ALLOWED_WHERE_TOKENS:
+                continue
+
+            # Se for um identificador (possível coluna)
+            if re.match(r"^[a-zA-Z0-9_.]+$", token):
+                self._validate_attribute(token, active_tables)
+            else:
+                # Caso encontre operadores inválidos (ex: %, +, /)
+                raise ParseError(f"Erro Sintático: Operador ou símbolo '{token}' inválido no WHERE.", "Sintatico")
