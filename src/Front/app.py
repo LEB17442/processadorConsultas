@@ -28,13 +28,28 @@ except ImportError:
     except ImportError as e:
         print(f"Aviso ao carregar HU2: {e}")
 
+# Importação da HU4
+otimizar_hu4 = None
+JanelaGrafoOtimizado = None
+try:
+    from HU4.optimizer import otimizar as otimizar_hu4
+    from HU4.visualizacao import JanelaGrafoOtimizado
+except ImportError:
+    try:
+        from src.HU4.optimizer import otimizar as otimizar_hu4
+        from src.HU4.visualizacao import JanelaGrafoOtimizado
+    except ImportError as e:
+        print(f"Aviso ao carregar HU4: {e}")
+
 
 class AppHU1_HU2:
     def __init__(self, root):
         self.root = root
-        self.root.title("Processador de Consultas SQL - HU1 e HU2")
-        self.root.geometry("850x700")
+        self.root.title("Processador de Consultas SQL")
+        self.root.geometry("900x780")
         self.root.configure(bg="#f0f0f0")
+        self.resultado_hu4 = None
+        self.sql_hu4 = ""
 
         # Carrega o schema.json
         schema_path = os.path.join(ROOT_DIR, "docs", "schema.json")
@@ -90,6 +105,19 @@ class AppHU1_HU2:
         )
         btn_analyze.pack(side="right", padx=5)
 
+        # Botão HU4: abre a janela com o grafo otimizado
+        self.btn_grafo_hu4 = tk.Button(
+            btn_frame,
+            text=" Ver Grafo Otimizado (HU4) ",
+            command=self.abrir_grafo_otimizado,
+            font=("Arial", 11, "bold"),
+            bd=2,
+            relief="raised",
+            cursor="hand2",
+            state="disabled"
+        )
+        self.btn_grafo_hu4.pack(side="right", padx=5)
+
         # 3. Label de Status
         self.lbl_status = tk.Label(
             main_frame, text="Status: Aguardando análise...", font=("Arial", 10, "italic"),
@@ -109,6 +137,19 @@ class AppHU1_HU2:
             bg="#eef6ff", fg="#003366", bd=1, relief="solid"
         )
         self.txt_algebra.pack(fill="x", pady=(0, 10))
+
+        # Campo HU4: Álgebra Relacional Otimizada
+        lbl_otimizada = tk.Label(
+            main_frame, text="HU4 - Álgebra Relacional Otimizada (pós-heurísticas):", font=("Arial", 11, "bold"),
+            bg="#f0f0f0", anchor="w"
+        )
+        lbl_otimizada.pack(fill="x", pady=(0, 5))
+
+        self.txt_otimizada = tk.Text(
+            main_frame, height=4, wrap="word", font=("Menlo" if sys.platform == "darwin" else "Consolas", 11, "bold"),
+            bg="#eefaf0", fg="#1b5e20", bd=1, relief="solid"
+        )
+        self.txt_otimizada.pack(fill="x", pady=(0, 10))
 
         # 5. Campo HU1: Estrutura Parseada (JSON / Erros)
         lbl_output = tk.Label(
@@ -148,15 +189,48 @@ class AppHU1_HU2:
             else:
                 self._display_algebra("Módulo HU2 (converter.py) não foi localizado ou importado.")
 
+            # Step 3: Executa a HU4 (Otimização heurística e grafo otimizado)
+            self._executar_hu4(parsed_result, sql_query)
+
         except ParseError as pe:
             self.lbl_status.config(text=f"Status: ❌ Erro {pe.error_type} Detectado (HU1)", fg="red")
             self._display_algebra("N/A (Falha na validação da consulta)")
+            self._limpar_hu4("N/A (Falha na validação da consulta)")
             self._display_output(f"❌ [ERRO {pe.error_type.upper()}]\n{pe.message}")
 
         except Exception as e:
             self.lbl_status.config(text="Status: ❌ Erro Inesperado", fg="red")
             self._display_algebra("N/A")
+            self._limpar_hu4("N/A")
             self._display_output(f"❌ Ocorreu um erro inesperado: {str(e)}")
+
+    def _executar_hu4(self, parsed_result, sql_query: str):
+        if not otimizar_hu4:
+            self._limpar_hu4("Módulo HU4 (optimizer.py) não foi localizado ou importado.")
+            return
+        try:
+            self.resultado_hu4 = otimizar_hu4(parsed_result, self.schema)
+            self.sql_hu4 = sql_query
+            self._display_otimizada(self.resultado_hu4.algebra)
+            if JanelaGrafoOtimizado:
+                self.btn_grafo_hu4.config(state="normal")
+        except Exception as e_hu4:
+            self._limpar_hu4(f"Erro na otimização HU4: {str(e_hu4)}")
+
+    def _limpar_hu4(self, text: str):
+        self.resultado_hu4 = None
+        self.btn_grafo_hu4.config(state="disabled")
+        self._display_otimizada(text)
+
+    def abrir_grafo_otimizado(self):
+        if self.resultado_hu4 and JanelaGrafoOtimizado:
+            JanelaGrafoOtimizado(self.root, self.resultado_hu4, self.sql_hu4)
+
+    def _display_otimizada(self, text: str):
+        self.txt_otimizada.config(state="normal")
+        self.txt_otimizada.delete("1.0", tk.END)
+        self.txt_otimizada.insert("1.0", text)
+        self.txt_otimizada.update_idletasks()
 
     def _display_algebra(self, text: str):
         self.txt_algebra.config(state="normal")
