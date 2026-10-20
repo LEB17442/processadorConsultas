@@ -231,6 +231,7 @@ class AppHU1_HU2:
         self.txt_otimizada.delete("1.0", tk.END)
         self.txt_otimizada.insert("1.0", text)
         self.txt_otimizada.update_idletasks()
+        
 
     def _display_algebra(self, text: str):
         self.txt_algebra.config(state="normal")
