@@ -174,7 +174,7 @@ class AppHU1_HU2:
         try:
             # Step 1: Executa a HU1 (Parsing e Validação)
             parsed_result = self.parser.parse(sql_query)
-            self.lbl_status.config(text="Status: ✅ Consulta Válida (HU1 & HU2)", fg="green")
+            self.lbl_status.config(text="Status: ✅ Consulta Válida (HU1, HU2 & HU4)", fg="green")
 
             formatted_json = json.dumps(parsed_result, indent=4, ensure_ascii=False)
             self._display_output(f"--- ESTRUTURA PARSEADA COM SUCESSO (HU1) ---\n\n{formatted_json}")
