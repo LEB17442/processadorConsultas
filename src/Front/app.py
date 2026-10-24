@@ -51,6 +51,26 @@ except ImportError:
     except ImportError as e:
         print(f"Aviso ao carregar HU5: {e}")
 
+# 5. Importação da HU3 (tree.py e visualizacao.py)
+# Imports separados: se a janela falhar, o grafo continua sendo construído pelo mesmo
+# caminho do HU1 (HU1.parser), e o "except ParseError" abaixo continua capturando os erros do HU3
+build_operator_tree = None
+JanelaGrafoOriginal = None
+try:
+    from HU3.tree import build_operator_tree
+except ImportError:
+    try:
+        from src.HU3.tree import build_operator_tree
+    except ImportError as e:
+        print(f"Aviso ao carregar HU3: {e}")
+try:
+    from HU3.visualizacao import JanelaGrafoOriginal
+except ImportError:
+    try:
+        from src.HU3.visualizacao import JanelaGrafoOriginal
+    except ImportError as e:
+        print(f"Aviso ao carregar a janela da HU3: {e}")
+
 
 class AppHU_Completo:
     def __init__(self, root):
@@ -60,6 +80,8 @@ class AppHU_Completo:
         self.root.configure(bg="#f0f0f0")
         self.resultado_hu4 = None
         self.sql_hu4 = ""
+        self.arvore_hu3 = None
+        self.sql_hu3 = ""
 
         # Carrega o schema.json
         schema_path = os.path.join(ROOT_DIR, "docs", "schema.json")
@@ -127,6 +149,18 @@ class AppHU_Completo:
         )
         self.btn_grafo_hu4.pack(side="right", padx=5)
 
+        self.btn_grafo_hu3 = tk.Button(
+            btn_frame,
+            text=" Ver Grafo Original (HU3) ",
+            command=self.abrir_grafo_original,
+            font=("Arial", 11, "bold"),
+            bd=2,
+            relief="raised",
+            cursor="hand2",
+            state="disabled"
+        )
+        self.btn_grafo_hu3.pack(side="right", padx=5)
+
         # 3. Status
         self.lbl_status = tk.Label(
             main_frame, text="Status: Aguardando análise...", font=("Arial", 10, "italic"),
@@ -188,6 +222,9 @@ class AppHU_Completo:
             formatted_json = json.dumps(parsed_result, indent=4, ensure_ascii=False)
             self._display_output(f"--- ESTRUTURA PARSEADA COM SUCESSO (HU1) ---\n\n{formatted_json}")
 
+            # Step 1.1: HU3 Grafo de Operadores Original (try/except próprio: não derruba HU4/HU5)
+            self._executar_hu3(parsed_result, sql_query)
+
             # Step 2: HU2 Conversão
             if converter_hu2:
                 try:
@@ -203,15 +240,40 @@ class AppHU_Completo:
 
         except ParseError as pe:
             self.lbl_status.config(text=f"Status: ❌ Erro {pe.error_type} Detectado (HU1)", fg="red")
+            self._limpar_hu3()
             self._limpar_hu4("N/A (Falha na validação da consulta)")
             self._display_plano("N/A (Falha na validação da consulta)")
             self._display_output(f"❌ [ERRO {pe.error_type.upper()}]\n{pe.message}")
 
         except Exception as e:
             self.lbl_status.config(text="Status: ❌ Erro Inesperado", fg="red")
+            self._limpar_hu3()
             self._limpar_hu4("N/A")
             self._display_plano("N/A")
             self._display_output(f"❌ Ocorreu um erro inesperado: {str(e)}")
+
+    def _executar_hu3(self, parsed_result, sql_query: str):
+        self._limpar_hu3()
+        if not build_operator_tree:
+            return
+        try:
+            self.arvore_hu3 = build_operator_tree(parsed_result)
+            self.sql_hu3 = sql_query
+            if JanelaGrafoOriginal:
+                self.btn_grafo_hu3.config(state="normal")
+        except ParseError as pe_hu3:
+            self.lbl_status.config(text=f"Status: ❌ Erro {pe_hu3.error_type} Detectado (HU3)", fg="red")
+            self._display_output(f"❌ [ERRO {pe_hu3.error_type.upper()}]\n{pe_hu3.message}")
+        except Exception as e_hu3:
+            print(f"Aviso HU3: {e_hu3}")
+
+    def _limpar_hu3(self):
+        self.arvore_hu3 = None
+        self.btn_grafo_hu3.config(state="disabled")
+
+    def abrir_grafo_original(self):
+        if self.arvore_hu3 is not None and JanelaGrafoOriginal:
+            JanelaGrafoOriginal(self.root, self.arvore_hu3, self.sql_hu3)
 
     def _executar_hu4(self, parsed_result, sql_query: str):
         if not otimizar_hu4:
