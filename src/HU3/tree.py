@@ -1,0 +1,376 @@
+"""
+HU3 - Construção do Grafo de Operadores (grafo ORIGINAL, não otimizado)
+
+Recebe a consulta já validada pelo HU1 (dicionário do parser) e constrói, em
+memória, a árvore de operadores que representa a estratégia de execução da
+consulta exatamente como ela foi escrita, sem nenhuma heurística:
+
+    π  (projeção final: atributos do SELECT)               <- raiz
+    └── σ  (todas as condições do WHERE, ligadas por ∧)    <- omitida se não há WHERE
+        └── ⋈ (último JOIN)
+            ├── ⋈ (JOIN anterior)     junções encadeadas à esquerda: ((A ⋈ B) ⋈ C) ⋈ D
+            │   ├── A
+            │   └── B
+            └── C                     folhas = tabelas
+
+As arestas vão do filho para o pai: cada operador consome os resultados
+intermediários produzidos pelos filhos. Otimizar a árvore é papel do HU4.
+
+Uso:
+    from src.HU3.tree import build_operator_tree, render_ascii
+    arvore = build_operator_tree(parsed)      # parsed = SQLParserHU1(schema).parse(sql)
+    print(render_ascii(arvore))
+
+Cada nó (NoGrafo) segue o mesmo contrato lido pelo HU4 e pelo HU5:
+    tipo        -> 'tabela' | 'selecao' | 'projecao' | 'juncao'
+    filhos      -> lista de nós filhos (vazia nas folhas)
+    tabela      -> nome canônico da tabela (folhas)
+    condicao    -> tokens da condição (seleção/junção), com "AND" entre condições simples
+    atributos   -> atributos qualificados da projeção (ex.: "Cliente.Nome")
+    heuristicas -> sempre vazia no grafo original (quem preenche é o HU4)
+"""
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, Iterator, List, Optional, Sequence
+
+# O front importa "HU1.parser" (com src/ no sys.path) e os testes importam
+# "src.HU1.parser": para o Python são dois módulos com duas classes ParseError
+# diferentes. O estilo do import segue o pacote em que este módulo foi carregado,
+# para que o "except ParseError" de quem chamou capture os erros do HU3.
+if (__package__ or "").startswith("src."):
+    from src.database.schema import DatabaseSchema
+    from src.HU1.parser import ParseError, SQLParserHU1
+else:
+    from database.schema import DatabaseSchema
+    from HU1.parser import ParseError, SQLParserHU1
+
+OPERADORES = ("<=", ">=", "<>", "=", ">", "<")  # os mesmos aceitos pelo HU1
+SIMBOLOS = {"tabela": "", "selecao": "σ", "projecao": "π", "juncao": "⋈"}
+
+_NUMERO = re.compile(r"^[+-]?\d+(\.\d+)?$")
+_IDENTIFICADOR = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$")
+
+
+# ---------------------------------------------------------------------------
+# Nó do grafo de operadores
+# ---------------------------------------------------------------------------
+@dataclass(eq=False)  # eq=False: nós com o mesmo conteúdo continuam sendo nós distintos
+class NoGrafo:
+    tipo: str
+    filhos: List["NoGrafo"] = field(default_factory=list)
+    tabela: Optional[str] = None
+    condicao: Optional[List[str]] = None
+    atributos: Optional[List[str]] = None
+    heuristicas: List[str] = field(default_factory=list)
+
+    @property
+    def simbolo(self) -> str:
+        return SIMBOLOS[self.tipo]
+
+    def descricao(self) -> str:
+        return descricao_no(self)
+
+    def para_dict(self) -> Dict[str, Any]:
+        dados: Dict[str, Any] = {"tipo": self.tipo}
+        if self.tabela is not None:
+            dados["tabela"] = self.tabela
+        if self.condicao is not None:
+            dados["condicao"] = list(self.condicao)
+        if self.atributos is not None:
+            dados["atributos"] = list(self.atributos)
+        dados["heuristicas"] = list(self.heuristicas)
+        dados["filhos"] = [filho.para_dict() for filho in self.filhos]
+        return dados
+
+
+# ---------------------------------------------------------------------------
+# Percursos e exibição
+# ---------------------------------------------------------------------------
+def postorder(raiz: NoGrafo) -> Iterator[NoGrafo]:
+    """Filhos antes do pai (esquerda antes da direita): a ordem em que os operadores executam."""
+    for filho in raiz.filhos:
+        yield from postorder(filho)
+    yield raiz
+
+
+def preorder(raiz: NoGrafo) -> Iterator[NoGrafo]:
+    """Pai antes dos filhos: da projeção final (raiz) até as tabelas (folhas)."""
+    yield raiz
+    for filho in raiz.filhos:
+        yield from preorder(filho)
+
+
+def _texto_condicao(condicao: Optional[Sequence[str]]) -> str:
+    return " ".join("∧" if token.upper() == "AND" else token for token in condicao or [])
+
+
+def descricao_no(no: NoGrafo) -> str:
+    """Rótulo curto do nó, no mesmo formato do HU4: 'π a, b', 'σ cond', '⋈ cond' ou o nome da tabela."""
+    if no.tipo == "tabela":
+        return no.tabela or "?"
+    if no.tipo == "projecao":
+        return f"π {', '.join(no.atributos or ['*'])}"
+    return f"{SIMBOLOS[no.tipo]} {_texto_condicao(no.condicao)}"
+
+
+def _rotulo_ascii(no: NoGrafo) -> str:
+    if no.tipo == "tabela":
+        return no.tabela or "?"
+    if no.tipo == "projecao":
+        return f"π [{', '.join(no.atributos or ['*'])}]"
+    return f"{SIMBOLOS[no.tipo]} [{_texto_condicao(no.condicao)}]"
+
+
+def render_ascii(raiz: NoGrafo) -> str:
+    """Desenha a árvore em texto (raiz no topo, folhas = tabelas)."""
+    linhas = [_rotulo_ascii(raiz)]
+
+    def visitar(no: NoGrafo, prefixo: str) -> None:
+        for posicao, filho in enumerate(no.filhos):
+            ultimo = posicao == len(no.filhos) - 1
+            linhas.append(f"{prefixo}{'└── ' if ultimo else '├── '}{_rotulo_ascii(filho)}")
+            visitar(filho, prefixo + ("    " if ultimo else "│   "))
+
+    visitar(raiz, "")
+    return "\n".join(linhas)
+
+
+# ---------------------------------------------------------------------------
+# Normalização e validação
+# ---------------------------------------------------------------------------
+def _buscar_tabela(nome: str, tabelas: Sequence[str]) -> Optional[str]:
+    for tabela in tabelas:
+        if tabela.lower() == nome.lower():
+            return tabela
+    return None
+
+
+def _eh_literal(token: str) -> bool:
+    return (len(token) >= 2 and token[0] == token[-1] and token[0] in "'\"") or bool(_NUMERO.match(token))
+
+
+def _tabela_canonica(nome: Any, esquema: DatabaseSchema, onde: str) -> str:
+    real = esquema.get_real_table_name(str(nome).strip()) if nome else None
+    if not real:
+        raise ParseError(f"Erro Semântico: Tabela '{nome}' {onde} não existe no modelo relacional.", "Semantico")
+    return real
+
+
+def _qualificar(texto: str, disponiveis: Sequence[str], todas: Sequence[str],
+                esquema: DatabaseSchema, onde: str) -> str:
+    """'cliente.nome' -> 'Cliente.Nome'; 'ValorTotalPedido' -> 'Pedido.ValorTotalPedido'.
+
+    disponiveis: tabelas que podem ser usadas neste ponto da consulta
+    todas:       todas as tabelas do FROM/JOIN (para explicar melhor o erro)
+    """
+    if not _IDENTIFICADOR.match(texto):
+        raise ParseError(
+            f"Erro Sintático: '{texto}' {onde} não é um atributo válido "
+            "(textos devem vir entre aspas, ex.: 'Aberto').", "Sintatico"
+        )
+
+    if "." in texto:
+        prefixo, coluna = texto.split(".", 1)
+        tabela = _buscar_tabela(prefixo, disponiveis)
+        if tabela is None:
+            if _buscar_tabela(prefixo, todas):
+                raise ParseError(
+                    f"Erro Semântico: '{texto}' {onde} usa a tabela '{prefixo}', que só entra na consulta "
+                    "em um JOIN posterior. Reordene os JOINs.", "Semantico"
+                )
+            raise ParseError(
+                f"Erro Semântico: Tabela '{prefixo}' (em '{texto}' {onde}) não está no FROM/JOIN da consulta.",
+                "Semantico"
+            )
+        if not esquema.attribute_exists(tabela, coluna):
+            raise ParseError(
+                f"Erro Semântico: Atributo '{coluna}' não existe na tabela '{tabela}' ({onde}).", "Semantico"
+            )
+        return f"{tabela}.{esquema.get_real_attribute_name(tabela, coluna)}"
+
+    donos = [tabela for tabela in disponiveis if esquema.attribute_exists(tabela, texto)]
+    if not donos:
+        if any(esquema.attribute_exists(tabela, texto) for tabela in todas):
+            raise ParseError(
+                f"Erro Semântico: Atributo '{texto}' {onde} pertence a uma tabela que só entra na consulta "
+                "em um JOIN posterior. Reordene os JOINs.", "Semantico"
+            )
+        raise ParseError(
+            f"Erro Semântico: Atributo '{texto}' {onde} não pertence a nenhuma tabela da consulta.", "Semantico"
+        )
+    if len(donos) > 1:
+        exemplo = f"{donos[0]}.{esquema.get_real_attribute_name(donos[0], texto)}"
+        raise ParseError(
+            f"Erro Semântico: Atributo '{texto}' {onde} é ambíguo, pois existe nas tabelas {', '.join(donos)}. "
+            f"Informe no formato Tabela.coluna (ex.: {exemplo}).", "Semantico"
+        )
+    return f"{donos[0]}.{esquema.get_real_attribute_name(donos[0], texto)}"
+
+
+def _condicao_simples(tokens: Sequence[str], disponiveis: Sequence[str], todas: Sequence[str],
+                      esquema: DatabaseSchema, onde: str) -> List[str]:
+    """Valida 'operando operador operando' e devolve os tokens com os nomes canônicos."""
+    texto = " ".join(tokens)
+    if len(tokens) != 3 or tokens[1] not in OPERADORES or tokens[0] in OPERADORES or tokens[2] in OPERADORES:
+        raise ParseError(
+            f"Erro Sintático: Condição inválida {onde}: '{texto}'. Use o formato 'operando operador operando' "
+            "(ex.: Pedido.ValorTotalPedido > 100) com um dos operadores =, <>, <, >, <=, >=.", "Sintatico"
+        )
+    esquerda, operador, direita = tokens
+    if _eh_literal(esquerda) and _eh_literal(direita):
+        raise ParseError(
+            f"Erro Semântico: A condição '{texto}' {onde} não usa nenhum atributo. "
+            "Compare um atributo com um valor ou com outro atributo.", "Semantico"
+        )
+
+    def normalizar(operando: str) -> str:
+        # Literais ('Aberto', "x", 5000, 10.5) ficam como vieram; atributos ganham o nome canônico
+        return operando if _eh_literal(operando) else _qualificar(operando, disponiveis, todas, esquema, onde)
+
+    return [normalizar(esquerda), operador, normalizar(direita)]
+
+
+def _condicao_on(on: Any, tabela: str, disponiveis: Sequence[str], todas: Sequence[str],
+                 esquema: DatabaseSchema) -> List[str]:
+    onde = f"no ON do JOIN {tabela}"
+    if not isinstance(on, (list, tuple)):
+        raise ParseError(f"Erro Sintático: Condição ausente ou inválida {onde}.", "Sintatico")
+    return _condicao_simples([str(token) for token in on], disponiveis, todas, esquema, onde)
+
+
+def _condicoes_where(tokens: Sequence[str], tabelas: Sequence[str], esquema: DatabaseSchema) -> List[str]:
+    """Tokens do WHERE -> tokens normalizados, com "AND" entre as condições simples."""
+    if not tokens:
+        return []
+
+    nivel = 0
+    for token in tokens:
+        if token == "(":
+            nivel += 1
+        elif token == ")":
+            nivel -= 1
+            if nivel < 0:
+                break
+    if nivel != 0:
+        raise ParseError("Erro Sintático: Parênteses desbalanceados na cláusula WHERE.", "Sintatico")
+
+    # Só existe AND no escopo do trabalho, então os parênteses não mudam o significado
+    sem_parenteses = [token for token in tokens if token not in ("(", ")")]
+    if not sem_parenteses:
+        raise ParseError("Erro Sintático: Cláusula 'WHERE' informada sem condições.", "Sintatico")
+    for token in sem_parenteses:
+        if token.upper() in ("OR", "NOT"):
+            raise ParseError(
+                f"Erro Sintático: O operador lógico '{token}' não é suportado no WHERE; use apenas AND.", "Sintatico"
+            )
+
+    grupos: List[List[str]] = [[]]
+    for token in sem_parenteses:
+        if token.upper() == "AND":
+            grupos.append([])
+        else:
+            grupos[-1].append(token)
+
+    if len(grupos) > 1 and not grupos[-1]:
+        raise ParseError(
+            "Erro Sintático: A cláusula WHERE termina com 'AND', mas falta a condição depois dele.", "Sintatico"
+        )
+    if len(grupos) > 1 and not grupos[0]:
+        raise ParseError(
+            "Erro Sintático: A cláusula WHERE começa com 'AND', mas falta a condição antes dele.", "Sintatico"
+        )
+    if any(not grupo for grupo in grupos):
+        raise ParseError("Erro Sintático: Dois 'AND' seguidos na cláusula WHERE, sem condição entre eles.", "Sintatico")
+
+    resultado: List[str] = []
+    for grupo in grupos:
+        if resultado:
+            resultado.append("AND")
+        resultado.extend(_condicao_simples(grupo, tabelas, tabelas, esquema, "no WHERE"))
+    return resultado
+
+
+# ---------------------------------------------------------------------------
+# Construção do grafo original
+# ---------------------------------------------------------------------------
+def build_operator_tree(parsed: Dict[str, Any], schema: Any = None) -> NoGrafo:
+    """
+    Constrói o grafo de operadores ORIGINAL (não otimizado) e devolve a raiz (π final).
+
+    parsed: dicionário retornado por SQLParserHU1.parse (HU1).
+    schema: DatabaseSchema ou dict {tabela: [atributos]} com os nomes canônicos;
+            por padrão usa o modelo de src/database/schema.py.
+
+    Levanta ParseError ('Sintatico' ou 'Semantico') nas validações que o HU1 não faz.
+    """
+    if not isinstance(parsed, dict):
+        raise TypeError("build_operator_tree espera o dicionário devolvido pelo parser do HU1.")
+    # Duck typing em vez de isinstance: DatabaseSchema também pode ter sido carregado pelos dois caminhos
+    esquema = schema if hasattr(schema, "get_real_attribute_name") else DatabaseSchema(schema)
+
+    if not parsed.get("main_table"):
+        raise ParseError("Erro Sintático: Nenhuma tabela especificada após 'FROM'.", "Sintatico")
+    joins = list(parsed.get("joins") or [])
+    tabelas = [_tabela_canonica(parsed["main_table"], esquema, "do FROM")]
+    for join in joins:
+        tabelas.append(_tabela_canonica(join.get("table"), esquema, "do JOIN"))
+    for posicao, tabela in enumerate(tabelas):
+        if tabela in tabelas[:posicao]:
+            raise ParseError(
+                f"Erro Semântico: A tabela '{tabela}' aparece mais de uma vez no FROM/JOIN "
+                "(auto-junção sem apelido não é suportada).", "Semantico"
+            )
+
+    # SELECT: vira a projeção final (raiz)
+    select = [str(atributo).strip() for atributo in parsed.get("select_attributes") or [] if str(atributo).strip()]
+    if not select:
+        raise ParseError("Erro Sintático: Nenhum atributo informado na cláusula 'SELECT'.", "Sintatico")
+    atributos = [
+        atributo if atributo == "*" else _qualificar(atributo, tabelas, tabelas, esquema, "no SELECT")
+        for atributo in select
+    ]
+
+    # FROM/JOIN: junções na ordem escrita, encadeadas à esquerda; cada ON só enxerga
+    # as tabelas que já entraram na consulta até aquele JOIN
+    arvore = NoGrafo("tabela", tabela=tabelas[0])
+    for posicao, join in enumerate(joins, 1):
+        nova = tabelas[posicao]
+        condicao = _condicao_on(join.get("on"), nova, tabelas[:posicao + 1], tabelas, esquema)
+        arvore = NoGrafo("juncao", [arvore, NoGrafo("tabela", tabela=nova)], condicao=condicao)
+
+    # WHERE: uma única seleção com todas as condições, logo abaixo da projeção final
+    condicoes = _condicoes_where([str(token) for token in parsed.get("where_conditions") or []], tabelas, esquema)
+    if condicoes:
+        arvore = NoGrafo("selecao", [arvore], condicao=condicoes)
+
+    return NoGrafo("projecao", [arvore], atributos=atributos)
+
+
+def _schema_padrao() -> Dict[str, List[str]]:
+    caminho = Path(__file__).resolve().parents[2] / "docs" / "schema.json"
+    return json.loads(caminho.read_text(encoding="utf-8"))
+
+
+def build_operator_tree_sql(sql: str, schema: Optional[Dict[str, List[str]]] = None) -> NoGrafo:
+    """Atalho: valida o SQL com o parser do HU1 e constrói o grafo original."""
+    return build_operator_tree(SQLParserHU1(schema or _schema_padrao()).parse(sql))
+
+
+if __name__ == "__main__":
+    import sys
+
+    consulta = " ".join(sys.argv[1:]) or (
+        "SELECT Cliente.Nome, Pedido.ValorTotalPedido FROM Cliente "
+        "JOIN Pedido ON Cliente.idCliente = Pedido.Cliente_idCliente "
+        "WHERE ValorTotalPedido > 100"
+    )
+    print(f"SQL: {consulta}\n")
+    try:
+        print(render_ascii(build_operator_tree_sql(consulta)))
+    except ParseError as erro:
+        print(f"[{erro.error_type}] {erro.message}")
+        sys.exit(1)
