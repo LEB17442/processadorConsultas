@@ -9,13 +9,13 @@ for path in [BASE_DIR, ROOT_DIR]:
         sys.path.insert(0, path)
 
 import tkinter as tk
-from Front.app import AppHU1_HU2
+from Front.app import AppHU_Completo
 
 def main():
     root = tk.Tk()
-    app = AppHU1_HU2(root)
+    app = AppHU_Completo(root)
     
-    # Traz a janela para o primeiro plano no macOS
+    # Traz a janela para o primeiro plano
     root.lift()
     root.attributes('-topmost', True)
     root.after_idle(root.attributes, '-topmost', False)
