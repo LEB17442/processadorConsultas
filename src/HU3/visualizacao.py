@@ -19,6 +19,9 @@ import sys
 import tkinter as tk
 from typing import Any, List
 
+# O HU3 não desenha a árvore sozinho: reaproveita desenhar_arvore do HU4. Isso funciona
+# porque o NoGrafo usa os mesmos campos (tipo, filhos, ...) que o desenho do HU4 lê,
+# e assim os grafos original e otimizado ficam com o mesmo visual
 try:
     from HU4.visualizacao import CORES, FONTE_MONO, FUNDO, desenhar_arvore
 except ImportError:
@@ -57,7 +60,9 @@ class JanelaGrafoOriginal(tk.Toplevel):
     def __init__(self, master: tk.Misc, arvore: NoGrafo, sql: str = ""):
         super().__init__(master)
         self.arvore = arvore
-        # Mesma numeração pós-ordem do desenho (R1, R2, ...), para citar filhos e pai no painel
+        # Mesma numeração pós-ordem do desenho (R1, R2, ...), para citar filhos e pai no painel.
+        # R = resultado intermediário: R1 é produzido primeiro e o último R é a resposta da consulta.
+        # _pais guarda quem consome o resultado de cada nó (o destino da seta)
         self._numeros = {id(no): numero for numero, no in enumerate(postorder(arvore), 1)}
         self._pais = {id(filho): no for no in preorder(arvore) for filho in no.filhos}
         self.title("HU3 - Grafo de Operadores Original (não otimizado)")
@@ -159,9 +164,13 @@ class JanelaGrafoOriginal(tk.Toplevel):
         ])
 
     def _redesenhar(self) -> None:
+        # Desenha caixas (nós) e setas do filho para o pai (fluxo dos resultados intermediários).
+        # _mostrar_no é o callback: o HU4 o chama quando o mouse passa sobre um nó
         desenhar_arvore(self.canvas, self.arvore, self._mostrar_no)
 
     def _mostrar_no(self, no: Any, numero: int) -> None:
+        # Painel "Nó selecionado": o que o nó faz, de onde vêm as entradas (filhos)
+        # e para onde vai o resultado (pai)
         linhas = [f"R{numero}  ←  {descricao_no(no)}", "", f"Tipo: {NOMES.get(no.tipo, no.tipo)}"]
         if no.tipo == "tabela":
             linhas.append(f"Leitura da relação base {no.tabela}")

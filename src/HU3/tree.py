@@ -57,15 +57,23 @@ _IDENTIFICADOR = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?
 
 # ---------------------------------------------------------------------------
 # Nó do grafo de operadores
+#
+# Cada NoGrafo é uma "peça" da árvore: uma tabela ou um operador (σ, π, ⋈).
+# A árvore inteira é só uma peça (a raiz π) apontando para as filhas, que
+# apontam para as filhas delas, até chegar nas tabelas (folhas).
+#
+# Os NOMES dos campos são um contrato com as outras HUs: o HU4 (otimização),
+# o desenho do HU4 e o HU5 (plano) procuram exatamente "tipo", "filhos",
+# "tabela", "condicao" e "atributos". Por isso eles conseguem ler a árvore do HU3.
 # ---------------------------------------------------------------------------
 @dataclass(eq=False)  # eq=False: nós com o mesmo conteúdo continuam sendo nós distintos
 class NoGrafo:
-    tipo: str
-    filhos: List["NoGrafo"] = field(default_factory=list)
-    tabela: Optional[str] = None
-    condicao: Optional[List[str]] = None
-    atributos: Optional[List[str]] = None
-    heuristicas: List[str] = field(default_factory=list)
+    tipo: str                                              # 'tabela' | 'selecao' (σ) | 'projecao' (π) | 'juncao' (⋈)
+    filhos: List["NoGrafo"] = field(default_factory=list)  # quem alimenta este nó: 0 (tabela), 1 (σ, π) ou 2 (⋈)
+    tabela: Optional[str] = None                           # só nas folhas: nome da tabela, ex.: "Cliente"
+    condicao: Optional[List[str]] = None                   # só em σ e ⋈: tokens, ex.: ["Pedido.ValorTotalPedido", "=", "0"]
+    atributos: Optional[List[str]] = None                  # só na π: colunas do SELECT, ex.: ["Cliente.Nome"]
+    heuristicas: List[str] = field(default_factory=list)   # sempre vazia: o grafo original não aplica heurística (é o HU4)
 
     @property
     def simbolo(self) -> str:
@@ -89,9 +97,18 @@ class NoGrafo:
 
 # ---------------------------------------------------------------------------
 # Percursos e exibição
+#
+# Os percursos NÃO alteram a árvore: só a visitam numa ordem definida.
+#   postorder -> ordem de EXECUÇÃO (tabelas primeiro, π por último). É a base da
+#                numeração R1, R2, ... dos resultados intermediários, a mesma do HU5.
+#   preorder  -> de cima para baixo; a janela usa para descobrir o pai de cada nó.
+# Já descricao_no e render_ascii são só de EXIBIÇÃO: transformam nós em texto.
 # ---------------------------------------------------------------------------
 def postorder(raiz: NoGrafo) -> Iterator[NoGrafo]:
     """Filhos antes do pai (esquerda antes da direita): a ordem em que os operadores executam."""
+    # Um operador só pode rodar depois que as entradas (filhos) existirem,
+    # então primeiro visita todos os filhos e só depois devolve o próprio nó.
+    # Consulta 1: Cliente -> Pedido -> ⋈ -> σ -> π
     for filho in raiz.filhos:
         yield from postorder(filho)
     yield raiz
@@ -130,6 +147,8 @@ def render_ascii(raiz: NoGrafo) -> str:
     linhas = [_rotulo_ascii(raiz)]
 
     def visitar(no: NoGrafo, prefixo: str) -> None:
+        # O último filho usa "└──" e os demais "├──"; enquanto ainda há irmãos
+        # abaixo, os netos herdam "│   " para a linha vertical continuar.
         for posicao, filho in enumerate(no.filhos):
             ultimo = posicao == len(no.filhos) - 1
             linhas.append(f"{prefixo}{'└── ' if ultimo else '├── '}{_rotulo_ascii(filho)}")
@@ -141,6 +160,15 @@ def render_ascii(raiz: NoGrafo) -> str:
 
 # ---------------------------------------------------------------------------
 # Normalização e validação
+#
+# Esta parte NÃO é visual: garante que a árvore montada esteja CORRETA.
+#   Normalizar = escrever todo nome do jeito oficial do modelo e sempre com a
+#                tabela: "cliente.nome" -> "Cliente.Nome", "ValorTotalPedido" ->
+#                "Pedido.ValorTotalPedido". Sem isso, o HU4 e o HU5 receberiam
+#                nomes incompletos e não saberiam a qual tabela cada coluna pertence.
+#   Validar    = barrar o que o HU1 deixa passar (ON com coluna inexistente,
+#                atributo ambíguo, WHERE terminando em AND, "1 = 1", ...),
+#                levantando ParseError Sintatico ou Semantico.
 # ---------------------------------------------------------------------------
 def _buscar_tabela(nome: str, tabelas: Sequence[str]) -> Optional[str]:
     for tabela in tabelas:
@@ -173,10 +201,13 @@ def _qualificar(texto: str, disponiveis: Sequence[str], todas: Sequence[str],
             "(textos devem vir entre aspas, ex.: 'Aberto').", "Sintatico"
         )
 
+    # Caso 1: veio com a tabela ("cliente.nome"). Confere se a tabela pode ser
+    # usada aqui e se a coluna existe nela; devolve os dois com o nome oficial.
     if "." in texto:
         prefixo, coluna = texto.split(".", 1)
         tabela = _buscar_tabela(prefixo, disponiveis)
         if tabela is None:
+            # A tabela está na consulta, mas ainda não entrou neste ponto (dependência lógica)
             if _buscar_tabela(prefixo, todas):
                 raise ParseError(
                     f"Erro Semântico: '{texto}' {onde} usa a tabela '{prefixo}', que só entra na consulta "
@@ -192,6 +223,8 @@ def _qualificar(texto: str, disponiveis: Sequence[str], todas: Sequence[str],
             )
         return f"{tabela}.{esquema.get_real_attribute_name(tabela, coluna)}"
 
+    # Caso 2: veio sem a tabela ("ValorTotalPedido"). Procura quais tabelas da
+    # consulta têm essa coluna: nenhuma = erro, duas ou mais = ambíguo, uma = achou a dona.
     donos = [tabela for tabela in disponiveis if esquema.attribute_exists(tabela, texto)]
     if not donos:
         if any(esquema.attribute_exists(tabela, texto) for tabela in todas):
@@ -215,12 +248,14 @@ def _condicao_simples(tokens: Sequence[str], disponiveis: Sequence[str], todas: 
                       esquema: DatabaseSchema, onde: str) -> List[str]:
     """Valida 'operando operador operando' e devolve os tokens com os nomes canônicos."""
     texto = " ".join(tokens)
+    # Forma: exatamente 3 peças com o operador no meio (senão é erro Sintático)
     if len(tokens) != 3 or tokens[1] not in OPERADORES or tokens[0] in OPERADORES or tokens[2] in OPERADORES:
         raise ParseError(
             f"Erro Sintático: Condição inválida {onde}: '{texto}'. Use o formato 'operando operador operando' "
             "(ex.: Pedido.ValorTotalPedido > 100) com um dos operadores =, <>, <, >, <=, >=.", "Sintatico"
         )
     esquerda, operador, direita = tokens
+    # Sentido: comparar dois valores ("1 = 1") não filtra nada da tabela (erro Semântico)
     if _eh_literal(esquerda) and _eh_literal(direita):
         raise ParseError(
             f"Erro Semântico: A condição '{texto}' {onde} não usa nenhum atributo. "
@@ -247,6 +282,7 @@ def _condicoes_where(tokens: Sequence[str], tabelas: Sequence[str], esquema: Dat
     if not tokens:
         return []
 
+    # 1) Parênteses precisam abrir e fechar certo
     nivel = 0
     for token in tokens:
         if token == "(":
@@ -258,7 +294,7 @@ def _condicoes_where(tokens: Sequence[str], tabelas: Sequence[str], esquema: Dat
     if nivel != 0:
         raise ParseError("Erro Sintático: Parênteses desbalanceados na cláusula WHERE.", "Sintatico")
 
-    # Só existe AND no escopo do trabalho, então os parênteses não mudam o significado
+    # 2) Só existe AND no escopo do trabalho, então os parênteses não mudam o significado
     sem_parenteses = [token for token in tokens if token not in ("(", ")")]
     if not sem_parenteses:
         raise ParseError("Erro Sintático: Cláusula 'WHERE' informada sem condições.", "Sintatico")
@@ -268,6 +304,8 @@ def _condicoes_where(tokens: Sequence[str], tabelas: Sequence[str], esquema: Dat
                 f"Erro Sintático: O operador lógico '{token}' não é suportado no WHERE; use apenas AND.", "Sintatico"
             )
 
+    # 3) Corta nos AND: [a, =, 1, AND, b, =, 0] -> [[a, =, 1], [b, =, 0]]
+    #    Um grupo vazio denuncia AND sobrando (no fim, no começo ou repetido)
     grupos: List[List[str]] = [[]]
     for token in sem_parenteses:
         if token.upper() == "AND":
@@ -286,6 +324,7 @@ def _condicoes_where(tokens: Sequence[str], tabelas: Sequence[str], esquema: Dat
     if any(not grupo for grupo in grupos):
         raise ParseError("Erro Sintático: Dois 'AND' seguidos na cláusula WHERE, sem condição entre eles.", "Sintatico")
 
+    # 4) Valida e normaliza cada condição e junta tudo de volta com "AND" (vai virar UMA σ)
     resultado: List[str] = []
     for grupo in grupos:
         if resultado:
@@ -295,7 +334,16 @@ def _condicoes_where(tokens: Sequence[str], tabelas: Sequence[str], esquema: Dat
 
 
 # ---------------------------------------------------------------------------
-# Construção do grafo original
+# Construção do grafo original  <- O CORAÇÃO DO HU3
+#
+# A árvore é montada de BAIXO para CIMA, como empilhar blocos:
+#   1. começa pela tabela do FROM                          Cliente
+#   2. cada JOIN abraça o que já existe (vira o filho      ⋈(Cliente, Pedido)
+#      esquerdo) e a tabela nova vira o filho direito      ⋈(⋈(Cliente, Pedido), Status)
+#   3. o WHERE inteiro vira UMA σ em cima das junções      σ(...)
+#   4. o SELECT vira a π, que fica na raiz                 π(σ(...))
+# Nada é otimizado: a σ fica lá em cima (filtra só depois de juntar tudo) e as
+# junções seguem a ordem escrita. Mudar isso é o trabalho do HU4.
 # ---------------------------------------------------------------------------
 def build_operator_tree(parsed: Dict[str, Any], schema: Any = None) -> NoGrafo:
     """
@@ -312,6 +360,7 @@ def build_operator_tree(parsed: Dict[str, Any], schema: Any = None) -> NoGrafo:
     # Duck typing em vez de isinstance: DatabaseSchema também pode ter sido carregado pelos dois caminhos
     esquema = schema if hasattr(schema, "get_real_attribute_name") else DatabaseSchema(schema)
 
+    # Tabelas: nomes oficiais na ordem do FROM/JOIN, ex.: ["Cliente", "Pedido", "Status"]
     if not parsed.get("main_table"):
         raise ParseError("Erro Sintático: Nenhuma tabela especificada após 'FROM'.", "Sintatico")
     joins = list(parsed.get("joins") or [])
@@ -325,7 +374,8 @@ def build_operator_tree(parsed: Dict[str, Any], schema: Any = None) -> NoGrafo:
                 "(auto-junção sem apelido não é suportada).", "Semantico"
             )
 
-    # SELECT: vira a projeção final (raiz)
+    # SELECT: vira a projeção final (raiz). Aqui só preparamos a lista de colunas;
+    # o nó π é criado no último passo, para ficar no topo da árvore
     select = [str(atributo).strip() for atributo in parsed.get("select_attributes") or [] if str(atributo).strip()]
     if not select:
         raise ParseError("Erro Sintático: Nenhum atributo informado na cláusula 'SELECT'.", "Sintatico")
@@ -336,17 +386,21 @@ def build_operator_tree(parsed: Dict[str, Any], schema: Any = None) -> NoGrafo:
 
     # FROM/JOIN: junções na ordem escrita, encadeadas à esquerda; cada ON só enxerga
     # as tabelas que já entraram na consulta até aquele JOIN
-    arvore = NoGrafo("tabela", tabela=tabelas[0])
+    arvore = NoGrafo("tabela", tabela=tabelas[0])                  # passo 1: a tabela do FROM
     for posicao, join in enumerate(joins, 1):
         nova = tabelas[posicao]
+        # tabelas[:posicao + 1] = tabelas disponíveis até este JOIN (regra das dependências lógicas)
         condicao = _condicao_on(join.get("on"), nova, tabelas[:posicao + 1], tabelas, esquema)
+        # passo 2: a árvore atual vira o filho ESQUERDO e a tabela nova o filho DIREITO
         arvore = NoGrafo("juncao", [arvore, NoGrafo("tabela", tabela=nova)], condicao=condicao)
 
-    # WHERE: uma única seleção com todas as condições, logo abaixo da projeção final
+    # WHERE: uma única seleção com todas as condições, logo abaixo da projeção final (passo 3)
     condicoes = _condicoes_where([str(token) for token in parsed.get("where_conditions") or []], tabelas, esquema)
     if condicoes:
         arvore = NoGrafo("selecao", [arvore], condicao=condicoes)
 
+    # Passo 4: a π fecha a árvore no topo. Devolvemos a RAIZ: a partir dela,
+    # descendo pelos filhos, chega-se a todos os nós (é isso que a janela, o HU4 e o HU5 recebem)
     return NoGrafo("projecao", [arvore], atributos=atributos)
 
 
